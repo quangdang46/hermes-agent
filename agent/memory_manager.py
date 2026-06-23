@@ -129,6 +129,264 @@ def sanitize_context(text: str) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# Extractive memory fallback — regex-based fact extraction when LLM
+# compression returns no structured facts.
+# ---------------------------------------------------------------------------
+
+# Each entry is (label, pattern_list) where pattern_list contains regex
+# strings matched case-insensitively.  The label becomes the prefix of the
+# extracted fact (e.g. "Decision: ...").
+_EXTRACTIVE_PATTERNS: list = [  # list of (label: str, patterns: list[str])
+    (
+        "Decision",
+        [
+            r"decided\s+to\s+(.+?)(?:\.|$)",
+            r"let'?s?\s+go\s+with\s+(.+?)(?:\.|$)",
+            r"\bapproved\b\s*(.+?)(?:\.|$)",
+            r"\bchose\b\s*(.+?)(?:\.|$)",
+            r"\bselected\b\s*(.+?)(?:\.|$)",
+            r"opted\s+for\s+(.+?)(?:\.|$)",
+        ],
+    ),
+    (
+        "Preference",
+        [
+            r"(?:user\s+)?prefers\s+(.+?)(?:\.|$)",
+            r"(?:user\s+)?(?:likes|like)\s+(.+?)(?:\.|$)",
+            r"(?:user\s+)?liked\s+(.+?)(?:\.|$)",
+            r"(?:user\s+)?(?:wants|want)\s+(.+?)(?:\.|$)",
+            r"(?:user\s+)?wanted\s+(.+?)(?:\.|$)",
+        ],
+    ),
+    (
+        "Tech-fact",
+        [
+            r"\bAPI\s+is\s+(.+?)(?:\.|$)",
+            r"\bendpoint\s+is\s+(.+?)(?:\.|$)",
+            r"\bversion\s+is\s+(.+?)(?:\.|$)",
+            r"built\s+with\s+(.+?)(?:\.|$)",
+            r"\buses\s+(.+?)(?:\.|$)",
+            r"runs\s+on\s+(.+?)(?:\.|$)",
+        ],
+    ),
+    (
+        "Bug",
+        [
+            r"\bbug\s+is\s+(.+?)(?:\.|$)",
+            r"\bissue\s+is\s+(.+?)(?:\.|$)",
+            r"fixed\s+by\s+(.+?)(?:\.|$)",
+            r"caused\s+by\s+(.+?)(?:\.|$)",
+        ],
+    ),
+]
+
+# URL and file-path extraction (standalone category — no label prefix used).
+_URL_RE = re.compile(
+    r"https?://[^\s)'\"\]}]+"
+    r"|"
+    r"(?:(?:/[a-zA-Z0-9_./-]+)+)",
+    re.IGNORECASE,
+)
+
+# Path anchor: a leading /, ~/, ./ or a word-char followed by path components
+# that look like code paths (containing dots, slashes, common source dirs).
+_PATH_RE = re.compile(
+    r"(?:(?:/(?:[a-zA-Z0-9_]+/)+(?:[a-zA-Z0-9_][a-zA-Z0-9_.-]*))"
+    r"|"
+    r"(?:~/(?:[a-zA-Z0-9_]+/)+(?:[a-zA-Z0-9_][a-zA-Z0-9_.-]*))"
+    r"|"
+    r"(?:\.\.?/(?:[a-zA-Z0-9_]+/)+(?:[a-zA-Z0-9_][a-zA-Z0-9_.-]*))"
+    r")",
+)
+
+# -- Combined pattern that scans for any trigger phrase across categories
+#    so we can pull a surrounding sentence instead of a short tail match.
+_TRIGGER_RE = re.compile(
+    r"(?:"
+    r"decided\s+to|let'?s?\s+go\s+with|approved|chose|selected|opted\s+for"
+    r"|"
+    r"prefers|likes|like\b|liked|wants|want\b|wanted"
+    r"|"
+    r"\bAPI\s+is\b|\bendpoint\s+is\b|\bversion\s+is\b|built\s+with\b|\buses\b|runs\s+on\b"
+    r"|"
+    r"\bbug\s+is\b|\bissue\s+is\b|fixed\s+by\b|caused\s+by\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _extract_message_text(msg: Dict[str, Any]) -> str:
+    """Flatten a message dict to a single text string for regex scanning.
+
+    Handles both plain-string content and structured content block arrays
+    (OpenAI-style format), returning an empty string when neither applies.
+    """
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text", "")
+                if text:
+                    parts.append(text)
+        return " ".join(parts)
+    return ""
+
+
+def _extract_urls_and_paths(text: str) -> List[str]:
+    """Extract URLs and file-system-like paths from text."""
+    seen: set[str] = set()
+    results: list[str] = []
+
+    # URLs
+    for m in _URL_RE.finditer(text):
+        match_text = m.group(0).strip()
+        # Filter false positives — single-char or very short matches
+        if len(match_text) < 6:
+            continue
+        # Exclude things that look like code tokens, not paths
+        if match_text.startswith("/") and match_text.count("/") < 2:
+            continue
+        if match_text not in seen:
+            seen.add(match_text)
+            results.append(f"Url: {match_text}")
+
+    # File paths
+    for m in _PATH_RE.finditer(text):
+        match_text = m.group(0).strip()
+        if match_text in seen:
+            continue
+        seen.add(match_text)
+        results.append(f"Path: {match_text}")
+
+    return results
+
+
+def _extract_trigger_sentences(text: str) -> List[str]:
+    """Extract whole sentences containing trigger phrases."""
+    results: list[str] = []
+    seen: set[str] = set()
+
+    for m in _TRIGGER_RE.finditer(text):
+        start = m.start()
+        # Find the sentence boundary before the match
+        sent_start = text.rfind(".", 0, start)
+        if sent_start == -1:
+            sent_start = text.rfind("\n", 0, start)
+        sent_start = max(sent_start, 0)
+        # Walk back past whitespace
+        while sent_start > 0 and text[sent_start - 1] in " \t\n\r":
+            sent_start -= 1
+        if sent_start > 0 and text[sent_start] in ".!?\n":
+            sent_start += 1
+
+        # Find the sentence boundary after the match
+        sent_end = text.find(".", m.end())
+        if sent_end == -1:
+            sent_end = text.find("\n", m.end())
+        if sent_end == -1:
+            sent_end = len(text)
+        else:
+            sent_end += 1  # include the period/newline
+
+        sentence = text[sent_start:sent_end].strip()
+        if not sentence or sentence in seen:
+            continue
+        # Skip very short sentences (likely noise)
+        if len(sentence) < 15:
+            continue
+        seen.add(sentence)
+        results.append(sentence)
+
+    return results
+
+
+def extractive_memory_fallback(messages: List[Dict[str, Any]]) -> List[str]:
+    """Regex-based fact extraction from conversation messages.
+
+    Runs when LLM-based memory extraction returns no results.  Covers:
+
+    - Decisions / approvals
+    - User preferences
+    - Technical facts (APIs, versions, dependencies)
+    - URLs and file-system paths
+    - Bug/issue references
+
+    Returns a list of clean fact strings (e.g. ``"Decision: opted for "
+    "PostgreSQL over MySQL"``).  Returns an empty list when nothing
+    is found (graceful degradation).
+    """
+    if not messages:
+        return []
+
+    combined_parts: list[str] = []
+    for msg in messages:
+        text = _extract_message_text(msg)
+        if not text:
+            continue
+
+        # 1. Try structured category-specific patterns first (precise)
+        for label, patterns in _EXTRACTIVE_PATTERNS:
+            for pattern in patterns:
+                for pm in re.finditer(pattern, text, re.IGNORECASE):
+                    captured = pm.group(1).strip()
+                    if captured and len(captured) > 8:
+                        combined_parts.append(f"{label}: {captured}")
+
+        # 2. Broader sentence-level extraction for trigger phrases that
+        #    the category-specific regex might miss.
+        sentences = _extract_trigger_sentences(text)
+        # Deduplicate against already-captured items
+        existing_lower = {s.lower() for s in combined_parts}
+        for sentence in sentences:
+            # Classify the sentence by its trigger word
+            sentence_lower = sentence.lower()
+            if any(
+                w in sentence_lower
+                for w in ("decided to", "let us go with", "let's go with", "approved", "chose", "selected", "opted for")
+            ):
+                label = "Decision"
+            elif any(
+                w in sentence_lower
+                for w in ("prefers", "likes", "like", "liked", "wants", "want", "wanted")
+            ):
+                label = "Preference"
+            elif any(
+                w in sentence_lower
+                for w in ("api is", "endpoint is", "version is", "built with", "uses", "runs on")
+            ):
+                label = "Tech-fact"
+            elif any(
+                w in sentence_lower
+                for w in ("bug is", "issue is", "fixed by", "caused by")
+            ):
+                label = "Bug"
+            else:
+                continue
+
+            fact = f"{label}: {sentence}"
+            if fact.lower() not in existing_lower:
+                existing_lower.add(fact.lower())
+                combined_parts.append(fact)
+
+        # 3. Extract URLs and file paths
+        combined_parts.extend(_extract_urls_and_paths(text))
+
+    # Final deduplication
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in combined_parts:
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+
+    return result
+
+
 class StreamingContextScrubber:
     """Stateful scrubber for streaming text that may contain split memory-context spans.
 
@@ -781,6 +1039,10 @@ class MemoryManager:
 
         Returns combined text from providers to include in the compression
         summary prompt. Empty string if no provider contributes.
+
+        Falls back to :func:`extractive_memory_fallback` when no provider
+        returns structured memory content — ensures at least some facts are
+        preserved even when LLM-based extraction is unavailable.
         """
         parts = []
         for provider in self._providers:
@@ -793,7 +1055,22 @@ class MemoryManager:
                     "Memory provider '%s' on_pre_compress failed: %s",
                     provider.name, e,
                 )
-        return "\n\n".join(parts)
+
+        combined = "\n\n".join(parts)
+
+        # If provider extraction produced nothing, fall back to regex-based
+        # extraction so we never silently drop all context.
+        if not combined.strip():
+            extracted = extractive_memory_fallback(messages)
+            if extracted:
+                combined = "Extracted memory facts (regex fallback):\n" + "\n".join(
+                    f"  - {fact}" for fact in extracted
+                )
+                logger.debug(
+                    "Extractive memory fallback produced %d facts", len(extracted)
+                )
+
+        return combined
 
     @staticmethod
     def _provider_memory_write_metadata_mode(provider: MemoryProvider) -> str:

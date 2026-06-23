@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from agent.model_metadata import estimate_request_tokens_rough
+from agent.context_compressor import should_cache_skip_pruning
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +346,38 @@ def compress_context(
         focus_topic,
     )
     agent._emit_status(COMPACTION_STATUS)
+
+    # ── Anthropic prompt-cache-aware skip ──────────────────────────
+    # When the agent uses Anthropic prompt caching (``_use_prompt_caching``
+    # is True), the cached prefix has a 5-minute TTL.  Skipping compression
+    # during that window preserves the ~75% input token cost savings from
+    # ``system_and_3`` caching.  A compression pass would rewrite the
+    # conversation history and invalidate the cached prefix, so the NEXT
+    # API request pays full price instead of cached price.
+    #
+    # This is purely additive: sessions without Anthropic caching always
+    # proceed to normal compression.  Manual ``/compress`` with
+    # ``force=True`` always bypasses the skip.
+    if (
+        not force
+        and getattr(agent, "_use_prompt_caching", False)
+        and should_cache_skip_pruning(agent.session_id)
+    ):
+        agent._emit_status(
+            "📦 Skipping compression: Anthropic prompt cache is still "
+            "warm — compressing now would invalidate ~75% input token "
+            "cost savings. Compression will fire when the cache expires "
+            "(~5 min since last API call)."
+        )
+        logger.info(
+            "Compression skipped for session=%s: Anthropic prompt cache "
+            "is warm — deferring to save input token costs.",
+            agent.session_id or "none",
+        )
+        _existing_sp = getattr(agent, "_cached_system_prompt", None)
+        if not _existing_sp:
+            _existing_sp = agent._build_system_prompt(system_message)
+        return messages, _existing_sp
 
     # ── Compression lock ────────────────────────────────────────────────
     # Atomic, state.db-backed lock per session_id.  Without this, two
