@@ -34,6 +34,52 @@ from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
+# ----------------------------------------------------------------------
+# Anthropic prompt cache touch tracker (module-level, session-keyed)
+#
+# ``_cache_touch_times[session_id]`` = ``time.monotonic()`` of the most
+# recent Anthropic API call.  Used by ``should_cache_skip_pruning`` to
+# decide whether compression can be skipped when the 5-minute prompt
+# cache is still warm, saving input tokens and latency.
+# ----------------------------------------------------------------------
+_cache_touch_times: Dict[str, float] = {}
+
+
+def record_cache_touch(session_id: str) -> None:
+    """Record that an Anthropic API call was just made for *session_id*.
+
+    Updates the monotonic-clock timestamp in ``_cache_touch_times``.
+    No-ops on empty *session_id* to avoid polluting the dict with
+    synthetic or transient identifiers.
+    """
+    if session_id:
+        _cache_touch_times[session_id] = time.monotonic()
+
+
+def should_cache_skip_pruning(
+    session_id: str | None,
+    ttl_seconds: int = 300,
+) -> bool:
+    """Return True when the Anthropic prompt cache is still warm.
+
+    The Anthropic prompt cache has a default TTL of 5 minutes
+    (``ttl_seconds=300``, matching ``prompt_caching.cache_ttl: "5m"``).
+    When the last API call for *session_id* falls inside the TTL window,
+    the cached prefix is still valid and callers can skip
+    compression/pruning to preserve the ~75% input token cost savings
+    from ``system_and_3`` caching.
+
+    Returns False when *session_id* is empty or unknown, so sessions
+    without Anthropic caching always proceed normally.
+    """
+    if not session_id:
+        return False
+    last_touch = _cache_touch_times.get(session_id)
+    if last_touch is None:
+        return False
+    return (time.monotonic() - last_touch) < ttl_seconds
+
+
 HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
 HISTORICAL_IN_PROGRESS_HEADING = "## Historical In-Progress State"
 HISTORICAL_PENDING_ASKS_HEADING = "## Historical Pending User Asks"
@@ -162,6 +208,12 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+
+# Token reserve subtracted from the compaction threshold so compression fires
+# early enough to leave headroom for tool outputs and other unknowns between
+# the preflight check and the actual API call.  Without this, a barely-under-
+# threshold estimate can still overflow on the real request (#49361).
+RESERVE_TOKENS = 2000
 
 # Hard ceiling for the deterministic summary-failure handoff.  The fallback is
 # only meant to preserve continuity anchors from the dropped window, not to
@@ -658,6 +710,9 @@ class ContextCompressor(ContextEngine):
         owning session ends.
         """
         self._previous_summary = None
+        # Drop the cache-touch timestamp — the old session's Anthropic
+        # prompt cache expired when its session_id changed.
+        _cache_touch_times.pop(session_id, None)
 
     def update_model(
         self,
@@ -956,12 +1011,17 @@ class ContextCompressor(ContextEngine):
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.
 
+        A small ``RESERVE_TOKENS`` buffer is subtracted from the threshold so
+        compaction fires before tool outputs or other overhead between the
+        preflight check and the real API call can push usage over the edge.
+
         Includes anti-thrashing protection: if the last two compressions
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
         """
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
-        if tokens < self.threshold_tokens:
+        effective_threshold = self.threshold_tokens - RESERVE_TOKENS
+        if tokens < effective_threshold:
             return False
         # Anti-thrashing: back off if recent compressions were ineffective
         if self._ineffective_compression_count >= 2:
@@ -1936,17 +1996,68 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _sanitize_tool_pairs(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Fix orphaned tool_call / tool_result pairs after compression.
 
-        Two failure modes:
+        Five concerns:
         1. A tool *result* references a call_id whose assistant tool_call was
            removed (summarized/truncated).  The API rejects this with
            "No tool call found for function call output with call_id ...".
+
         2. An assistant message has tool_calls whose results were dropped.
            The API rejects this because every tool_call must be followed by
            a tool result with the matching call_id.
 
-        This method removes orphaned results and inserts stub results for
-        orphaned calls so the message list is always well-formed.
+        3. The same tool_call_id may appear in multiple tool_use blocks across
+           different assistant turns (e.g., read_file called twice through a
+           retry).  Downstream providers require unique call_ids across the
+           entire request — a duplicate triggers "multiple tool uses with the
+           same call_id".  Keep the *first* occurrence and drop duplicates.
+
+        4. Orphaned tool_result messages whose tool_call_id has no matching
+           tool_use anywhere in the message list (rare after pass 1, but the
+           dedup pass can remove a tool_use whose result survives).
+
+        5. Trailing tool_use blocks at the very end of the message list whose
+           results were dropped by compression (no matching tool_result in the
+           list).  Unlike pass 2 (which inserts stubs), pass 5 detects that
+           a tool_use block appears AFTER the last tool_result with a matching
+           id — meaning its result was genuinely compressed away — and strips
+           the trailing tool_use itself rather than inserting a bogus stub.
         """
+        # ── Pass a: deduplicate tool_call_ids across turns ──────────────
+        seen_call_ids: set = set()
+        dedup_tool_calls = 0
+        deduped_messages: List[Dict[str, Any]] = []
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                tcs = msg.get("tool_calls") or []
+                if not tcs:
+                    deduped_messages.append(msg)
+                    continue
+                new_tcs: List[Any] = []
+                for tc in tcs:
+                    cid = self._get_tool_call_id(tc)
+                    if cid and cid in seen_call_ids:
+                        dedup_tool_calls += 1
+                    else:
+                        if cid:
+                            seen_call_ids.add(cid)
+                        new_tcs.append(tc)
+                if new_tcs:
+                    deduped_messages.append(
+                        {**msg, "tool_calls": new_tcs} if len(new_tcs) != len(tcs) else msg
+                    )
+                else:
+                    # All tool calls deduplicated away — drop the empty assistant
+                    deduped_messages.append(msg)
+            else:
+                deduped_messages.append(msg)
+        messages = deduped_messages
+        if dedup_tool_calls and not self.quiet_mode:
+            logger.info(
+                "Compression sanitizer: deduplicated %d tool_call(s) with duplicate call_id",
+                dedup_tool_calls,
+            )
+
+        # ── Rebuild the surviving (post-dedup) sets ─────────────────────
         surviving_call_ids: set = set()
         for msg in messages:
             if msg.get("role") == "assistant":
@@ -1962,7 +2073,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 if cid:
                     result_call_ids.add(cid)
 
-        # 1. Remove tool results whose call_id has no matching assistant tool_call
+        # 1. Drop orphaned tool results (no matching assistant tool_call)
         orphaned_results = result_call_ids - surviving_call_ids
         if orphaned_results:
             messages = [
@@ -1971,8 +2082,52 @@ This compaction should PRIORITISE preserving all information related to the focu
             ]
             if not self.quiet_mode:
                 logger.info("Compression sanitizer: removed %d orphaned tool result(s)", len(orphaned_results))
+            # Rebuild after dropped results: still valid for passes 2+5
+            result_call_ids = set()
+            for msg in messages:
+                if msg.get("role") == "tool":
+                    cid = msg.get("tool_call_id")
+                    if cid:
+                        result_call_ids.add(cid)
+
+        # 5. Drop trailing tool_use blocks whose results were compressed away.
+        #    A block is "trailing" when every one of its call_ids has no matching
+        #    tool_result anywhere in the list AND the block appears after the last
+        #    tool_result with a known id — i.e. its result was genuinely lost to
+        #    compression rather than yet-to-arrive in a well-formed conversation.
+        last_result_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "tool":
+                last_result_idx = i
+                break
+        trailing_dropped = 0
+        if last_result_idx >= 0:
+            # Walk backward from end: any assistant with tool_calls whose call_ids
+            # are ALL absent from result_call_ids AND that appears after the last
+            # tool_result is a trailing orphan — drop the tool_calls.
+            for i in range(len(messages) - 1, last_result_idx, -1):
+                msg = messages[i]
+                if msg.get("role") != "assistant":
+                    continue
+                tcs = msg.get("tool_calls") or []
+                if not tcs:
+                    continue
+                # All call_ids in this block have no matching result
+                if all(cid in surviving_call_ids and cid not in result_call_ids
+                       for tc in tcs
+                       if (cid := self._get_tool_call_id(tc))):
+                    # Drop the tool_calls from this message — strip to text-only
+                    trailing_dropped += len(tcs)
+                    messages[i] = {**msg, "tool_calls": []}
+
+        if trailing_dropped and not self.quiet_mode:
+            logger.info(
+                "Compression sanitizer: dropped %d trailing tool_call(s) with no result",
+                trailing_dropped,
+            )
 
         # 2. Add stub results for assistant tool_calls whose results were dropped
+        #    (but only for non-trailing calls — trailing ones were handled in pass 5).
         missing_results = surviving_call_ids - result_call_ids
         if missing_results:
             patched: List[Dict[str, Any]] = []
