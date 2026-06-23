@@ -1,0 +1,21 @@
+name: mempalace
+version: 0.8.0
+description: >-
+  MemPalace — persistent memory via the mempalace MCP server and mpr CLI.
+  Organizes knowledge into a structured memory palace with tiered retrieval
+  (semantic search, hybrid keyword+vector, graph traversal, and multi-agent
+  coordination). Local-first with optional multi-session persistence via
+  the MCP-based memory service.
+author: Hermes Agent
+plugin_class: plugins.memory.mempalace:MemPalaceMemoryProvider
+external_dependencies:
+  - name: mpr
+    install: "cargo install mempalace-cli || brew install mempalace/tap/mpr"
+    check: "mpr --version"
+hooks:
+  - prefetch
+  - sync_turn
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write
+  - system_prompt_block
