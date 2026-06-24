@@ -56,6 +56,7 @@ from agent.model_metadata import (
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
+from agent.context_compressor import record_cache_touch
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -1831,6 +1832,14 @@ def run_conversation(
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
                     agent.context_compressor.update_from_response(usage_dict)
+
+                    # Track Anthropic prompt cache touch timestamp so
+                    # ``should_cache_skip_pruning`` can skip compression
+                    # when the 5-minute TTL is still warm.  Only relevant
+                    # when ``_use_prompt_caching`` is set (Anthropic native
+                    # or Anthropic-compatible gateway).
+                    if agent._use_prompt_caching:
+                        record_cache_touch(agent.session_id)
 
                     # Cache discovered context length after successful call.
                     # Only persist limits confirmed by the provider (parsed
