@@ -3884,13 +3884,13 @@ class AIAgent:
         return False
 
     @staticmethod
-    def _build_keepalive_http_client(base_url: str = "") -> Any:
+    def _build_keepalive_http_client(base_url: str = "", *, verify: Any = True) -> Any:
         try:
             import httpx as _httpx
             import socket as _socket
 
             if "api.githubcopilot.com" in str(base_url or "").lower():
-                return _httpx.Client()
+                return _httpx.Client(verify=verify)
 
             _sock_opts = [(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)]
             if hasattr(_socket, "TCP_KEEPIDLE"):
@@ -3904,8 +3904,10 @@ class AIAgent:
             # Explicitly read proxy settings while still honoring NO_PROXY for
             # loopback / local endpoints such as a locally hosted sub2api.
             _proxy = _get_proxy_for_base_url(base_url)
+            # verify lives on the transport: httpx ignores the client-level
+            # ``verify`` when a custom ``transport=`` is supplied.
             return _httpx.Client(
-                transport=_httpx.HTTPTransport(socket_options=_sock_opts),
+                transport=_httpx.HTTPTransport(socket_options=_sock_opts, verify=verify),
                 proxy=_proxy,
             )
         except Exception:
@@ -4214,6 +4216,43 @@ class AIAgent:
 
         return True
 
+    def _try_refresh_vertex_client_credentials(self) -> bool:
+        """Re-mint the Vertex OAuth2 access token and rebuild the OpenAI client.
+
+        Vertex tokens live ~1 hour. On a long-lived agent (gateway session) a
+        cached client's bearer token will expire mid-session, producing a 401.
+        This re-resolves credentials via the adapter (which refreshes the
+        underlying google-auth Credentials object when near expiry), swaps the
+        new token into the client kwargs, and rebuilds the primary OpenAI
+        client. Returns True when a usable token+base_url were obtained.
+        """
+        if self.api_mode != "chat_completions" or self.provider != "vertex":
+            return False
+
+        try:
+            from agent.vertex_adapter import get_vertex_config
+
+            token, base_url = get_vertex_config()
+        except Exception as exc:
+            logger.debug("Vertex credential refresh failed: %s", exc)
+            return False
+
+        if not isinstance(token, str) or not token.strip():
+            return False
+        if not isinstance(base_url, str) or not base_url.strip():
+            return False
+
+        self.api_key = token.strip()
+        self.base_url = base_url.strip().rstrip("/")
+        self._client_kwargs["api_key"] = self.api_key
+        self._client_kwargs["base_url"] = self.base_url
+
+        if not self._replace_primary_openai_client(reason="vertex_credential_refresh"):
+            return False
+
+        logger.info("Vertex AI OAuth token refreshed")
+        return True
+
     def _try_refresh_copilot_client_credentials(self) -> bool:
         """Refresh Copilot credentials and rebuild the shared OpenAI client.
 
@@ -4344,6 +4383,22 @@ class AIAgent:
         # applied across credential swaps and client rebuilds, not just at
         # first construction.
         self._apply_user_default_headers()
+
+        # Per-provider extra HTTP headers (providers.<name>.extra_headers /
+        # custom_providers[].extra_headers) — applied last so the most
+        # specific config level survives credential swaps and rebuilds too.
+        # SECURITY: values may carry credentials — never log them.
+        if self.api_mode not in ("anthropic_messages", "bedrock_converse"):
+            try:
+                from hermes_cli.config import (
+                    apply_custom_provider_extra_headers_to_client_kwargs,
+                )
+
+                apply_custom_provider_extra_headers_to_client_kwargs(
+                    self._client_kwargs, base_url,
+                )
+            except Exception:
+                logger.debug("custom-provider extra_headers skipped", exc_info=True)
 
     def _apply_user_default_headers(self) -> None:
         """Merge user-configured request headers onto the OpenAI client.
@@ -5122,7 +5177,7 @@ class AIAgent:
             "alibaba", "minimax", "minimax-cn",
             "opencode-go", "opencode-zen",
             "zai", "bedrock",
-            "xiaomi",
+            "xiaomi", "vertex",
         }:
             return True
         base = (getattr(self, "base_url", "") or "").lower()
@@ -5133,6 +5188,9 @@ class AIAgent:
             or "opencode.ai/zen/" in base
             or "bigmodel.cn" in base
             or "xiaomimimo.com" in base
+            # Vertex AI OpenAI-compat endpoint — Gemini model ids keep dots
+            # (e.g. google/gemini-3.5-flash); the hyphenated form is wrong.
+            or "aiplatform.googleapis.com" in base
             # AWS Bedrock runtime endpoints — defense-in-depth when
             # ``provider`` is unset but ``base_url`` still names Bedrock.
             or "bedrock-runtime." in base
@@ -5581,7 +5639,6 @@ class AIAgent:
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
-            toolsets=function_args.get("toolsets"),
             tasks=function_args.get("tasks"),
             max_iterations=function_args.get("max_iterations"),
             acp_command=function_args.get("acp_command"),
